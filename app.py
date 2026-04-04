@@ -227,10 +227,9 @@ st.markdown("""
         color: #f87171;
     }
 
-    /* Hide Streamlit chrome */
+    /* Hide Streamlit chrome (keep header for sidebar toggle) */
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
-    header {visibility: hidden;}
 
     /* Tabs */
     .stTabs [data-baseweb="tab-list"] {
