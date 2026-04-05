@@ -494,44 +494,16 @@ def fetch_spy_putcall_ratio() -> dict:
 # VALUATION DATA
 # ──────────────────────────────────────────────
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=86400, show_spinner=False)
 def fetch_shiller_cape() -> pd.DataFrame:
-    """
-    Try to fetch Shiller CAPE data from the free GitHub API.
-    Falls back to empty DataFrame if unavailable.
-    """
-    urls = [
-        "https://posix4e.github.io/shiller_wrapper_data/data/stock_market_data.json",
-    ]
-    for url in urls:
-        try:
-            resp = requests.get(url, timeout=15)
-            if resp.status_code == 200:
-                data = resp.json()
-                records = data.get("data", data) if isinstance(data, dict) else data
-                if isinstance(records, list) and len(records) > 0:
-                    df = pd.DataFrame(records)
-                    # Normalize column names
-                    col_map = {}
-                    for c in df.columns:
-                        cl = c.lower()
-                        if "date" in cl:
-                            col_map[c] = "date"
-                        elif cl == "cape" or "cape" in cl:
-                            col_map[c] = "cape"
-                        elif cl == "sp500" or "sp500" in cl or "s&p" in cl:
-                            col_map[c] = "sp500"
-                        elif cl == "earnings" or "earning" in cl:
-                            col_map[c] = "earnings"
-                    df = df.rename(columns=col_map)
-                    if "date" in df.columns and "cape" in df.columns:
-                        df["date"] = pd.to_datetime(df["date"], errors="coerce")
-                        df["cape"] = pd.to_numeric(df["cape"], errors="coerce")
-                        df = df.dropna(subset=["date", "cape"])
-                        return df[["date", "cape"]].sort_values("date").reset_index(drop=True)
-        except Exception:
-            continue
-    return pd.DataFrame(columns=["date", "cape"])
+    """Load Shiller CAPE data from bundled CSV file."""
+    csv_path = os.path.join(os.path.dirname(__file__), "shiller_cape_history.csv")
+    try:
+        df = pd.read_csv(csv_path, parse_dates=["date"])
+        df = df.sort_values("date").reset_index(drop=True)
+        return df
+    except Exception:
+        return pd.DataFrame(columns=["date", "cape"])
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -1602,6 +1574,79 @@ def main():
             else:
                 render_metric_card("Earnings Yield", "N/A")
 
+        # ── Z-Score Regime Extremity ──
+        st.markdown('<div class="section-header" style="margin-top:0.5rem">Regime Extremity — Z-Scores</div>', unsafe_allow_html=True)
+
+        # Compute z-scores for key indicators
+        z_scores = {}
+
+        # CAPE z-score (using bundled history)
+        if not shiller_df.empty and len(shiller_df) > 12:
+            cape_mean = shiller_df["cape"].mean()
+            cape_std = shiller_df["cape"].std()
+            cape_current = cape_val if cape_val else shiller_df["cape"].iloc[-1]
+            z_scores["Shiller CAPE"] = (cape_current - cape_mean) / cape_std if cape_std > 0 else 0
+
+        # RSI z-score (using full RSI history)
+        if len(rsi.dropna()) > 50:
+            z_scores["RSI (14)"] = (current_rsi - rsi.mean()) / rsi.std()
+
+        # VIX z-score
+        if not vix_data.empty:
+            vix_all = vix_data["Close"].dropna()
+            if len(vix_all) > 50:
+                z_scores["VIX"] = (current_vix - vix_all.mean()) / vix_all.std()
+
+        # Drawdown z-score
+        dd_all = dd_info["series"].dropna()
+        if len(dd_all) > 50:
+            z_scores["Drawdown"] = (dd_info["current_dd"] - dd_all.mean()) / dd_all.std()
+
+        # Price vs 200 DMA z-score
+        pct_above_series = ((close - close.rolling(200).mean()) / close.rolling(200).mean() * 100).dropna()
+        if len(pct_above_series) > 50:
+            z_scores["Price vs 200 DMA"] = (sma_info["pct_above"] - pct_above_series.mean()) / pct_above_series.std()
+
+        # AAII net sentiment z-score
+        if aaii_info["available"] and not aaii_df.empty and len(aaii_df) > 50:
+            net_series = aaii_df["bullish"] - aaii_df["bearish"]
+            z_scores["AAII Net Sentiment"] = (aaii_info["net"] - net_series.mean()) / net_series.std()
+
+        if z_scores:
+            # Display as a horizontal bar chart
+            z_names = list(z_scores.keys())
+            z_vals = list(z_scores.values())
+            z_colors = ["#f87171" if abs(z) > 2 else ("#fb923c" if abs(z) > 1 else "#34d399") for z in z_vals]
+
+            fig = go.Figure()
+            fig.add_trace(go.Bar(
+                y=z_names, x=z_vals, orientation="h",
+                marker_color=z_colors,
+                text=[f"{z:+.2f}σ" for z in z_vals],
+                textposition="outside",
+                textfont=dict(size=11, family="JetBrains Mono"),
+            ))
+            fig.add_vline(x=0, line_color="#f0f4f8", line_width=1)
+            fig.add_vline(x=2, line_color="#f87171", line_dash="dash", line_width=1)
+            fig.add_vline(x=-2, line_color="#f87171", line_dash="dash", line_width=1)
+            fig.add_vline(x=1, line_color="#fb923c", line_dash="dot", line_width=1)
+            fig.add_vline(x=-1, line_color="#fb923c", line_dash="dot", line_width=1)
+            fig.update_layout(
+                title="How Extreme Is the Current Regime? (standard deviations from mean)",
+                xaxis_title="Z-Score (σ)",
+                xaxis_range=[-3.5, 3.5],
+                height=max(250, len(z_scores) * 50 + 100),
+                **{k: v for k, v in CHART_LAYOUT.items() if k != "height"},
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+            st.markdown("""
+            <div style="font-family:'DM Sans',sans-serif; font-size:0.78rem; color:#6b7d93;">
+                <strong>Green</strong> = within 1σ (normal) · <strong>Orange</strong> = 1–2σ (elevated) · <strong>Red</strong> = beyond 2σ (extreme).
+                Z-scores computed against available history for each indicator. Extreme readings in multiple indicators simultaneously suggest unusual market conditions.
+            </div>
+            """, unsafe_allow_html=True)
+
         # Shiller CAPE historical chart
         if not shiller_df.empty:
             cape_filtered = filter_by_date_range(shiller_df, chart_days * 3, date_col="date")  # show wider range for CAPE
@@ -1636,7 +1681,7 @@ def main():
                 line=dict(color="#38bdf8", width=2),
                 fill="tozeroy", fillcolor="rgba(56,189,248,0.08)",
             ))
-            fig.update_layout(title="US Dollar Index (DXY)", **CHART_LAYOUT)
+            fig.update_layout(title="US Dollar Index (DXY)", yaxis_range=[80, 120], **CHART_LAYOUT)
             st.plotly_chart(fig, use_container_width=True)
 
     # ────── 2×2 MATRIX TAB ──────
