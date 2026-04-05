@@ -331,15 +331,35 @@ def load_aaii_history() -> pd.DataFrame:
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_sp500_constituents(fmp_key: str) -> list:
-    """Get S&P 500 constituent tickers from FMP."""
+    """Get S&P 500 constituent tickers. Tries FMP first, then Wikipedia as fallback."""
+    # Try FMP endpoints
+    if fmp_key:
+        urls = [
+            f"https://financialmodelingprep.com/api/v3/sp500_constituent?apikey={fmp_key}",
+            f"https://financialmodelingprep.com/stable/sp500-constituent?apikey={fmp_key}",
+        ]
+        for url in urls:
+            try:
+                resp = requests.get(url, timeout=15)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if isinstance(data, list) and len(data) > 0:
+                        symbols = [item["symbol"] for item in data if "symbol" in item]
+                        if symbols:
+                            return symbols
+            except Exception:
+                continue
+
+    # Fallback: scrape S&P 500 list from Wikipedia
     try:
-        url = f"https://financialmodelingprep.com/stable/sp500-constituent?apikey={fmp_key}"
-        resp = requests.get(url, timeout=15)
-        data = resp.json()
-        if isinstance(data, list) and len(data) > 0:
-            return [item["symbol"] for item in data if "symbol" in item]
+        tables = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
+        if tables:
+            df = tables[0]
+            symbols = df["Symbol"].str.replace(".", "-", regex=False).tolist()
+            return [s for s in symbols if isinstance(s, str) and len(s) < 10]
     except Exception:
         pass
+
     return []
 
 
@@ -862,15 +882,14 @@ def main():
             dgs10 = fetch_fred_series(market["fred_yield_curve"]["10y"], fred_key)
             nfci = fetch_fred_series(market["fred_nfci"], fred_key)
 
-        # Breadth data (FMP for constituent list, yfinance for prices)
+        # Breadth data (FMP or Wikipedia for constituent list, yfinance for prices)
         fmp_key = st.secrets.get("FMP_API_KEY", "")
         breadth_data = {}
         sp500_closes = pd.DataFrame()
-        if fmp_key:
-            constituents = fetch_sp500_constituents(fmp_key)
-            if constituents:
-                sp500_closes = fetch_sp500_prices(tuple(constituents), period="1y")
-                breadth_data = compute_breadth_from_prices(sp500_closes)
+        constituents = fetch_sp500_constituents(fmp_key)
+        if constituents:
+            sp500_closes = fetch_sp500_prices(tuple(constituents), period="1y")
+            breadth_data = compute_breadth_from_prices(sp500_closes)
 
         # Put/Call ratio (SPY options via yfinance)
         putcall_info = fetch_spy_putcall_ratio()
@@ -1182,15 +1201,15 @@ def main():
         has_breadth = bool(breadth_data)
 
         if not has_breadth:
-            missing_key = "FMP_API_KEY not set" if not st.secrets.get("FMP_API_KEY", "") else "Could not fetch data"
+            missing_key = "Could not fetch S&P 500 constituent list or price data"
             st.markdown(f"""
             <div class="metric-card">
                 <div class="metric-label">Breadth Data Unavailable</div>
                 <div style="color:#6b7d93; font-family:'DM Sans',sans-serif; font-size:0.85rem; padding:0.5rem 0;">
-                    {missing_key}. Add your FMP API key to Streamlit secrets (Settings → Secrets) as:<br>
-                    <code>FMP_API_KEY = "your_key"</code><br><br>
-                    Get a free key at <a href="https://site.financialmodelingprep.com/register" target="_blank" style="color:#60a5fa">financialmodelingprep.com</a>.
-                    Breadth is computed from all ~500 S&P 500 constituents.
+                    {missing_key}. This may happen on first load or if Yahoo Finance is temporarily slow.<br>
+                    Try refreshing the page. If the issue persists, check your FMP API key in Streamlit secrets.<br><br>
+                    Breadth is computed from all ~500 S&P 500 constituents using FMP (constituent list) + Yahoo Finance (price data).
+                    Wikipedia is used as a fallback for the constituent list.
                 </div>
             </div>
             """, unsafe_allow_html=True)
