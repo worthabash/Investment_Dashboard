@@ -330,59 +330,78 @@ def load_aaii_history() -> pd.DataFrame:
 # ──────────────────────────────────────────────
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def fetch_sp500_constituents(fmp_key: str) -> list:
-    """Get S&P 500 constituent tickers. Tries FMP first, then Wikipedia as fallback."""
-    # Try FMP endpoints
-    if fmp_key:
-        urls = [
-            f"https://financialmodelingprep.com/api/v3/sp500_constituent?apikey={fmp_key}",
-            f"https://financialmodelingprep.com/stable/sp500-constituent?apikey={fmp_key}",
-        ]
-        for url in urls:
+def fetch_sp500_constituents(_fmp_key: str = "") -> list:
+    """
+    Get S&P 500 constituent tickers.
+    Primary source: Wikipedia (free, no API key needed).
+    Fallback: FMP API if available.
+    """
+    # Primary: Wikipedia
+    try:
+        url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+        tables = pd.read_html(url)
+        if tables and len(tables) > 0:
+            df = tables[0]
+            # The "Symbol" column contains tickers; dots need to become dashes for yfinance
+            symbols = df["Symbol"].str.replace(".", "-", regex=False).tolist()
+            symbols = [s for s in symbols if isinstance(s, str) and 0 < len(s) < 10]
+            if len(symbols) > 400:
+                return symbols
+    except Exception:
+        pass
+
+    # Fallback: FMP API
+    if _fmp_key:
+        for base in [
+            f"https://financialmodelingprep.com/api/v3/sp500_constituent?apikey={_fmp_key}",
+            f"https://financialmodelingprep.com/stable/sp500-constituent?apikey={_fmp_key}",
+        ]:
             try:
-                resp = requests.get(url, timeout=15)
+                resp = requests.get(base, timeout=15)
                 if resp.status_code == 200:
                     data = resp.json()
                     if isinstance(data, list) and len(data) > 0:
-                        symbols = [item["symbol"] for item in data if "symbol" in item]
-                        if symbols:
-                            return symbols
+                        return [item["symbol"] for item in data if "symbol" in item]
             except Exception:
                 continue
-
-    # Fallback: scrape S&P 500 list from Wikipedia
-    try:
-        tables = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
-        if tables:
-            df = tables[0]
-            symbols = df["Symbol"].str.replace(".", "-", regex=False).tolist()
-            return [s for s in symbols if isinstance(s, str) and len(s) < 10]
-    except Exception:
-        pass
 
     return []
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner="Loading S&P 500 breadth data...")
 def fetch_sp500_prices(tickers: tuple, period: str = "1y") -> pd.DataFrame:
     """
-    Batch-download daily close prices for all S&P 500 stocks via yfinance.
+    Batch-download daily close prices for S&P 500 stocks via yfinance.
+    Downloads in chunks to avoid timeouts.
     Returns a DataFrame with tickers as columns and dates as index.
     """
-    try:
-        # yfinance accepts a space-separated string for batch download
-        ticker_str = " ".join(tickers)
-        df = yf.download(ticker_str, period=period, progress=False, auto_adjust=True, threads=True)
-        if df.empty:
-            return pd.DataFrame()
-        # Extract just the Close prices
-        if isinstance(df.columns, pd.MultiIndex):
-            closes = df["Close"]
-        else:
-            closes = df[["Close"]]
-        return closes
-    except Exception:
-        return pd.DataFrame()
+    all_closes = []
+    chunk_size = 100  # Download 100 tickers at a time
+    ticker_list = list(tickers)
+
+    for i in range(0, len(ticker_list), chunk_size):
+        chunk = ticker_list[i:i + chunk_size]
+        try:
+            ticker_str = " ".join(chunk)
+            df = yf.download(ticker_str, period=period, progress=False, auto_adjust=True, threads=True)
+            if df.empty:
+                continue
+            if isinstance(df.columns, pd.MultiIndex):
+                closes = df["Close"]
+            else:
+                # Single ticker case
+                closes = df[["Close"]]
+                closes.columns = [chunk[0]]
+            all_closes.append(closes)
+        except Exception:
+            continue
+
+    if all_closes:
+        result = pd.concat(all_closes, axis=1)
+        # Drop columns that are all NaN
+        result = result.dropna(axis=1, how="all")
+        return result
+    return pd.DataFrame()
 
 
 def compute_breadth_from_prices(closes: pd.DataFrame) -> dict:
@@ -390,7 +409,7 @@ def compute_breadth_from_prices(closes: pd.DataFrame) -> dict:
     Compute breadth indicators from a DataFrame of S&P 500 close prices.
     Columns = tickers, Index = dates.
     """
-    if closes.empty or closes.shape[1] < 10:
+    if closes.empty or closes.shape[1] < 5:
         return {}
 
     n_stocks = closes.shape[1]
@@ -886,10 +905,18 @@ def main():
         fmp_key = st.secrets.get("FMP_API_KEY", "")
         breadth_data = {}
         sp500_closes = pd.DataFrame()
+        breadth_debug = ""
         constituents = fetch_sp500_constituents(fmp_key)
         if constituents:
+            breadth_debug = f"Found {len(constituents)} constituents. Downloading prices..."
             sp500_closes = fetch_sp500_prices(tuple(constituents), period="1y")
-            breadth_data = compute_breadth_from_prices(sp500_closes)
+            if not sp500_closes.empty:
+                breadth_data = compute_breadth_from_prices(sp500_closes)
+                breadth_debug = f"Loaded {sp500_closes.shape[1]} stocks, {sp500_closes.shape[0]} days of data."
+            else:
+                breadth_debug = f"Got {len(constituents)} constituents but yfinance returned no price data."
+        else:
+            breadth_debug = f"Could not fetch constituent list. FMP key set: {bool(fmp_key)}."
 
         # Put/Call ratio (SPY options via yfinance)
         putcall_info = fetch_spy_putcall_ratio()
@@ -1208,8 +1235,7 @@ def main():
                 <div style="color:#6b7d93; font-family:'DM Sans',sans-serif; font-size:0.85rem; padding:0.5rem 0;">
                     {missing_key}. This may happen on first load or if Yahoo Finance is temporarily slow.<br>
                     Try refreshing the page. If the issue persists, check your FMP API key in Streamlit secrets.<br><br>
-                    Breadth is computed from all ~500 S&P 500 constituents using FMP (constituent list) + Yahoo Finance (price data).
-                    Wikipedia is used as a fallback for the constituent list.
+                    <strong>Debug:</strong> {breadth_debug}
                 </div>
             </div>
             """, unsafe_allow_html=True)
