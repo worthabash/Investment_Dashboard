@@ -304,7 +304,7 @@ def fetch_fred_series(series_id: str, api_key: str, period: str = "2y") -> pd.Se
     """Fetch a time series from FRED."""
     try:
         fred = Fred(api_key=api_key)
-        start = datetime.now() - timedelta(days=730)
+        start = datetime.now() - timedelta(days=1825)
         data = fred.get_series(series_id, observation_start=start)
         return data.dropna()
     except Exception as e:
@@ -879,9 +879,9 @@ def main():
 
     # ── Fetch Data ──
     with st.spinner("Fetching market data..."):
-        spx_data = fetch_price_data(market["index_ticker"])
-        vix_data = fetch_price_data(market["vix_ticker"], period="1y")
-        dxy_data = fetch_price_data(market["dxy_ticker"], period="1y")
+        spx_data = fetch_price_data(market["index_ticker"], period="5y")
+        vix_data = fetch_price_data(market["vix_ticker"], period="5y")
+        dxy_data = fetch_price_data(market["dxy_ticker"], period="5y")
 
         hy_spread = pd.Series(dtype=float)
         dgs2 = pd.Series(dtype=float)
@@ -902,7 +902,7 @@ def main():
         constituents = fetch_sp500_constituents(fmp_key)
         if constituents:
             breadth_debug = f"Found {len(constituents)} constituents. Downloading prices..."
-            sp500_closes = fetch_sp500_prices(tuple(constituents), period="1y")
+            sp500_closes = fetch_sp500_prices(tuple(constituents), period="5y")
             if not sp500_closes.empty:
                 breadth_data = compute_breadth_from_prices(sp500_closes)
                 breadth_debug = f"Loaded {sp500_closes.shape[1]} stocks, {sp500_closes.shape[0]} days of data."
