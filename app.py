@@ -491,6 +491,99 @@ def fetch_spy_putcall_ratio() -> dict:
 
 
 # ──────────────────────────────────────────────
+# VALUATION DATA
+# ──────────────────────────────────────────────
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_shiller_cape() -> pd.DataFrame:
+    """
+    Try to fetch Shiller CAPE data from the free GitHub API.
+    Falls back to empty DataFrame if unavailable.
+    """
+    urls = [
+        "https://posix4e.github.io/shiller_wrapper_data/data/stock_market_data.json",
+    ]
+    for url in urls:
+        try:
+            resp = requests.get(url, timeout=15)
+            if resp.status_code == 200:
+                data = resp.json()
+                records = data.get("data", data) if isinstance(data, dict) else data
+                if isinstance(records, list) and len(records) > 0:
+                    df = pd.DataFrame(records)
+                    # Normalize column names
+                    col_map = {}
+                    for c in df.columns:
+                        cl = c.lower()
+                        if "date" in cl:
+                            col_map[c] = "date"
+                        elif cl == "cape" or "cape" in cl:
+                            col_map[c] = "cape"
+                        elif cl == "sp500" or "sp500" in cl or "s&p" in cl:
+                            col_map[c] = "sp500"
+                        elif cl == "earnings" or "earning" in cl:
+                            col_map[c] = "earnings"
+                    df = df.rename(columns=col_map)
+                    if "date" in df.columns and "cape" in df.columns:
+                        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+                        df["cape"] = pd.to_numeric(df["cape"], errors="coerce")
+                        df = df.dropna(subset=["date", "cape"])
+                        return df[["date", "cape"]].sort_values("date").reset_index(drop=True)
+        except Exception:
+            continue
+    return pd.DataFrame(columns=["date", "cape"])
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_spy_trailing_pe() -> dict:
+    """Compute trailing P/E from SPY's info via yfinance."""
+    try:
+        spy = yf.Ticker("SPY")
+        info = spy.info
+        pe = info.get("trailingPE", None)
+        fwd_pe = info.get("forwardPE", None)
+        earnings_yield = (1 / pe * 100) if pe and pe > 0 else None
+        return {
+            "available": True,
+            "trailing_pe": pe,
+            "forward_pe": fwd_pe,
+            "earnings_yield": earnings_yield,
+        }
+    except Exception:
+        return {"available": False}
+
+
+def render_valuation_sidebar() -> dict:
+    """Sidebar widget for manual valuation data entry."""
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### 📐 Valuation Update")
+    st.sidebar.markdown(
+        "<span style='font-size:0.78rem; color:#94a3b8;'>"
+        "Enter latest forward P/E and CAPE if auto-fetch fails.<br>"
+        "Sources: <a href='https://www.multpl.com/shiller-pe' target='_blank' style='color:#60a5fa;'>multpl.com</a>, "
+        "<a href='https://yardeni.com/charts/sp-500-sectors-forward-p-e-ratios/' target='_blank' style='color:#60a5fa;'>Yardeni</a>"
+        "</span>",
+        unsafe_allow_html=True,
+    )
+
+    manual_fwd_pe = st.sidebar.number_input(
+        "Forward P/E (manual)", min_value=0.0, max_value=100.0, value=0.0, step=0.1,
+        format="%.1f", help="Enter S&P 500 forward P/E. Leave 0 to use auto-fetched value.",
+        key="manual_fwd_pe",
+    )
+    manual_cape = st.sidebar.number_input(
+        "Shiller CAPE (manual)", min_value=0.0, max_value=100.0, value=0.0, step=0.1,
+        format="%.1f", help="Enter Shiller CAPE. Leave 0 to use auto-fetched value.",
+        key="manual_cape",
+    )
+
+    return {
+        "manual_fwd_pe": manual_fwd_pe if manual_fwd_pe > 0 else None,
+        "manual_cape": manual_cape if manual_cape > 0 else None,
+    }
+
+
+# ──────────────────────────────────────────────
 # GLOBAL DATE RANGE HELPER
 # ──────────────────────────────────────────────
 
@@ -869,6 +962,9 @@ def main():
     # ── AAII Sidebar Manual Input ──
     aaii_df = render_aaii_sidebar(aaii_df)
 
+    # ── Valuation Sidebar Manual Input ──
+    val_manual = render_valuation_sidebar()
+
     # ── AAII Staleness Check ──
     aaii_status = check_aaii_staleness(aaii_df)
     if aaii_status["stale"]:
@@ -913,6 +1009,10 @@ def main():
 
         # Put/Call ratio (SPY options via yfinance)
         putcall_info = fetch_spy_putcall_ratio()
+
+        # Valuation data
+        shiller_df = fetch_shiller_cape()
+        spy_pe_info = fetch_spy_trailing_pe()
 
     if spx_data.empty:
         st.error("Could not fetch S&P 500 data. Please try again later.")
@@ -1448,22 +1548,87 @@ def main():
     with tab_valuation:
         st.markdown('<div class="section-header">Valuation Indicators</div>', unsafe_allow_html=True)
 
+        # Determine best available values
+        trailing_pe = spy_pe_info.get("trailing_pe") if spy_pe_info.get("available") else None
+        forward_pe = val_manual.get("manual_fwd_pe") or (spy_pe_info.get("forward_pe") if spy_pe_info.get("available") else None)
+        earnings_yield = spy_pe_info.get("earnings_yield") if spy_pe_info.get("available") else None
+
+        # CAPE: try auto-fetched, then manual
+        cape_val = None
+        if not shiller_df.empty:
+            cape_val = shiller_df["cape"].iloc[-1]
+        if val_manual.get("manual_cape"):
+            cape_val = val_manual["manual_cape"]
+
+        # Metric cards row
+        vc1, vc2, vc3, vc4 = st.columns(4)
+
+        with vc1:
+            if trailing_pe:
+                pe_signal = "BEARISH" if trailing_pe > 25 else ("BULLISH" if trailing_pe < 18 else "NEUTRAL")
+                pe_class = "signal-bullish" if pe_signal == "BULLISH" else ("signal-bearish" if pe_signal == "BEARISH" else "signal-neutral")
+                render_metric_card("Trailing P/E", f"{trailing_pe:.1f}",
+                                  delta=f"{'▲' if trailing_pe > 20 else '▼'} vs 20 avg",
+                                  signal=pe_signal, signal_class=pe_class)
+            else:
+                render_metric_card("Trailing P/E", "N/A")
+
+        with vc2:
+            if forward_pe:
+                fwd_signal = "BEARISH" if forward_pe > 22 else ("BULLISH" if forward_pe < 16 else "NEUTRAL")
+                fwd_class = "signal-bullish" if fwd_signal == "BULLISH" else ("signal-bearish" if fwd_signal == "BEARISH" else "signal-neutral")
+                source = "manual" if val_manual.get("manual_fwd_pe") else "SPY"
+                render_metric_card("Forward P/E", f"{forward_pe:.1f}",
+                                  delta=f"{'▲' if forward_pe > 18 else '▼'} vs 18 avg · {source}",
+                                  signal=fwd_signal, signal_class=fwd_class)
+            else:
+                render_metric_card("Forward P/E", "N/A — enter in sidebar")
+
+        with vc3:
+            if cape_val:
+                cape_signal = "BEARISH" if cape_val > 30 else ("BULLISH" if cape_val < 20 else "NEUTRAL")
+                cape_class = "signal-bullish" if cape_signal == "BULLISH" else ("signal-bearish" if cape_signal == "BEARISH" else "signal-neutral")
+                source = "manual" if val_manual.get("manual_cape") else "Shiller"
+                render_metric_card("Shiller CAPE", f"{cape_val:.1f}",
+                                  delta=f"{'▲' if cape_val > 25 else '▼'} vs 25 median · {source}",
+                                  signal=cape_signal, signal_class=cape_class)
+            else:
+                render_metric_card("Shiller CAPE", "N/A — enter in sidebar")
+
+        with vc4:
+            if earnings_yield:
+                render_metric_card("Earnings Yield", f"{earnings_yield:.2f}%",
+                                  delta="inverse of trailing P/E")
+            else:
+                render_metric_card("Earnings Yield", "N/A")
+
+        # Shiller CAPE historical chart
+        if not shiller_df.empty:
+            cape_filtered = filter_by_date_range(shiller_df, chart_days * 3, date_col="date")  # show wider range for CAPE
+            if not cape_filtered.empty:
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(
+                    x=cape_filtered["date"], y=cape_filtered["cape"], name="Shiller CAPE",
+                    line=dict(color="#f59e0b", width=2),
+                    fill="tozeroy", fillcolor="rgba(245,158,11,0.08)",
+                ))
+                fig.add_hline(y=25, line_color="#334155", line_dash="dot", line_width=1, annotation_text="Median (~25)")
+                fig.add_hline(y=30, line_color="#fb923c", line_dash="dash", line_width=1, annotation_text="Expensive (>30)")
+                fig.add_hline(y=20, line_color="#34d399", line_dash="dash", line_width=1, annotation_text="Fair value (<20)")
+                fig.update_layout(title="Shiller CAPE Ratio (Cyclically Adjusted P/E)", yaxis_title="CAPE", **CHART_LAYOUT)
+                st.plotly_chart(fig, use_container_width=True)
+
         st.markdown("""
-        <div class="metric-card">
-            <div class="metric-label">Forward P/E & Shiller CAPE</div>
-            <div style="color:#6b7d93; font-family:'DM Sans',sans-serif; font-size:0.85rem; padding:0.5rem 0;">
-                <strong>Forward P/E Ratio</strong> — Requires earnings estimates from FactSet, Refinitiv, or S&P.
-                Free proxies: scrape from Yardeni Research or WSJ Markets page.<br><br>
-                <strong>Shiller CAPE</strong> — Monthly data available from
-                <a href="http://www.econ.yale.edu/~shiller/data.htm" target="_blank" style="color:#60a5fa">Robert Shiller's website</a>
-                or multpl.com. Consider adding as a manual entry or scheduled scrape.<br><br>
-                These indicators are <em>slow-moving</em> and best used as long-term context
-                rather than timing signals. They will be integrated in a future update.
-            </div>
+        <div style="font-family:'DM Sans',sans-serif; font-size:0.78rem; color:#6b7d93; margin-top:0.3rem;">
+            <strong>Trailing P/E</strong> and <strong>Forward P/E</strong> sourced from SPY via Yahoo Finance.
+            <strong>Shiller CAPE</strong> auto-fetched from Shiller's data (monthly). All can be overridden via sidebar (☰).
+            Valuation indicators are slow-moving and best used as long-term context rather than timing signals.
         </div>
         """, unsafe_allow_html=True)
 
+        # DXY chart
         if not dxy_data.empty:
+            st.markdown('<div class="section-header" style="margin-top:1rem">US Dollar Index</div>', unsafe_allow_html=True)
             dxy_close = filter_by_date_range(dxy_data["Close"], chart_days)
             fig = go.Figure()
             fig.add_trace(go.Scatter(
