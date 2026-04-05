@@ -326,6 +326,150 @@ def load_aaii_history() -> pd.DataFrame:
 
 
 # ──────────────────────────────────────────────
+# BREADTH DATA FETCHING
+# ──────────────────────────────────────────────
+
+BREADTH_TICKERS = {
+    "pct_above_200dma": "^MMTH",   # NYSE % above 200 DMA
+    "pct_above_50dma": "^MMFI",    # NYSE % above 50 DMA
+    "advancing": "^ADVN",           # NYSE advancing issues
+    "declining": "^DECN",           # NYSE declining issues
+    "new_highs": "^HIGX",           # NYSE new 52-week highs
+    "new_lows": "^LOWX",            # NYSE new 52-week lows
+}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_breadth_data(period: str = "2y") -> dict:
+    """
+    Fetch breadth indicators from Yahoo Finance.
+    Returns dict of DataFrames. Missing tickers return empty DataFrames.
+    """
+    results = {}
+    for key, ticker in BREADTH_TICKERS.items():
+        try:
+            df = yf.download(ticker, period=period, progress=False, auto_adjust=True)
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            results[key] = df if not df.empty else pd.DataFrame()
+        except Exception:
+            results[key] = pd.DataFrame()
+    return results
+
+
+def compute_breadth_from_data(breadth: dict) -> dict:
+    """
+    Compute derived breadth indicators:
+    - Advance-Decline line (cumulative)
+    - New Highs minus New Lows
+    - Breadth thrust (Zweig: 10-day EMA of advances / (advances + declines))
+    """
+    result = {}
+
+    # Advance-Decline Line
+    adv = breadth.get("advancing", pd.DataFrame())
+    dec = breadth.get("declining", pd.DataFrame())
+    if not adv.empty and not dec.empty:
+        # Align on common dates
+        ad_diff = adv["Close"].reindex(dec.index) - dec["Close"]
+        ad_diff = ad_diff.dropna()
+        result["ad_line"] = ad_diff.cumsum()
+        result["ad_diff"] = ad_diff
+
+        # Breadth thrust: 10-day EMA of (advances / (advances + declines))
+        total = adv["Close"].reindex(dec.index) + dec["Close"]
+        ratio = adv["Close"].reindex(dec.index) / total
+        ratio = ratio.dropna()
+        result["breadth_thrust"] = ratio.ewm(span=10, min_periods=5).mean()
+    else:
+        result["ad_line"] = pd.Series(dtype=float)
+        result["ad_diff"] = pd.Series(dtype=float)
+        result["breadth_thrust"] = pd.Series(dtype=float)
+
+    # New Highs minus New Lows
+    highs = breadth.get("new_highs", pd.DataFrame())
+    lows = breadth.get("new_lows", pd.DataFrame())
+    if not highs.empty and not lows.empty:
+        hl_diff = highs["Close"].reindex(lows.index) - lows["Close"]
+        result["hi_lo_diff"] = hl_diff.dropna()
+    else:
+        result["hi_lo_diff"] = pd.Series(dtype=float)
+
+    return result
+
+
+# ──────────────────────────────────────────────
+# CBOE PUT/CALL RATIO
+# ──────────────────────────────────────────────
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_putcall_ratio() -> pd.DataFrame:
+    """
+    Fetch CBOE total put/call ratio from their public CSV.
+    Falls back to empty DataFrame if unavailable.
+    """
+    urls = [
+        "https://cdn.cboe.com/api/global/us_options/market_statistics/daily/volume-put-call-ratios.csv",
+        "https://cdn.cboe.com/resources/options/volume_and_call_put_ratios/totalpc.csv",
+    ]
+    for url in urls:
+        try:
+            df = pd.read_csv(url)
+            # Normalize column names
+            df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
+            # Look for date and ratio columns
+            date_col = None
+            ratio_col = None
+            for c in df.columns:
+                if "date" in c or "trade" in c:
+                    date_col = c
+                if "ratio" in c and "total" in c.lower():
+                    ratio_col = c
+                elif "p/c" in c or "ratio" in c:
+                    ratio_col = ratio_col or c
+
+            if date_col and ratio_col:
+                result = pd.DataFrame({
+                    "date": pd.to_datetime(df[date_col], errors="coerce"),
+                    "pc_ratio": pd.to_numeric(df[ratio_col], errors="coerce"),
+                })
+                result = result.dropna().sort_values("date").reset_index(drop=True)
+                return result
+        except Exception:
+            continue
+
+    return pd.DataFrame(columns=["date", "pc_ratio"])
+
+
+# ──────────────────────────────────────────────
+# GLOBAL DATE RANGE HELPER
+# ──────────────────────────────────────────────
+
+DATE_RANGE_OPTIONS = {
+    "3 Months": 90,
+    "6 Months": 180,
+    "1 Year": 365,
+    "2 Years": 730,
+    "5 Years": 1825,
+}
+
+
+def filter_by_date_range(df_or_series, days: int, date_col=None):
+    """Filter a DataFrame or Series to the last N days."""
+    cutoff = datetime.now() - timedelta(days=days)
+    if isinstance(df_or_series, pd.Series):
+        if df_or_series.index.dtype == "datetime64[ns]" or hasattr(df_or_series.index, "date"):
+            return df_or_series[df_or_series.index >= cutoff]
+        return df_or_series
+    elif isinstance(df_or_series, pd.DataFrame):
+        if date_col and date_col in df_or_series.columns:
+            return df_or_series[df_or_series[date_col] >= cutoff]
+        elif df_or_series.index.dtype == "datetime64[ns]" or hasattr(df_or_series.index, "date"):
+            return df_or_series[df_or_series.index >= cutoff]
+    return df_or_series
+
+
+# ──────────────────────────────────────────────
 # AAII SIDEBAR INPUT & STALENESS CHECK
 # ──────────────────────────────────────────────
 
@@ -701,6 +845,13 @@ def main():
             dgs10 = fetch_fred_series(market["fred_yield_curve"]["10y"], fred_key)
             nfci = fetch_fred_series(market["fred_nfci"], fred_key)
 
+        # Breadth data
+        breadth_raw = fetch_breadth_data()
+        breadth_derived = compute_breadth_from_data(breadth_raw)
+
+        # Put/Call ratio
+        putcall_df = fetch_putcall_ratio()
+
     if spx_data.empty:
         st.error("Could not fetch S&P 500 data. Please try again later.")
         return
@@ -800,10 +951,23 @@ def main():
             render_metric_card("AAII Net", "N/A")
 
     # ──────────────────────────────────────────
+    # GLOBAL DATE RANGE SELECTOR
+    # ──────────────────────────────────────────
+    dr_cols = st.columns([3, 1])
+    with dr_cols[1]:
+        selected_range = st.selectbox(
+            "Chart range",
+            list(DATE_RANGE_OPTIONS.keys()),
+            index=3,  # default: 2 Years
+            key="global_date_range",
+        )
+    chart_days = DATE_RANGE_OPTIONS[selected_range]
+
+    # ──────────────────────────────────────────
     # TABS
     # ──────────────────────────────────────────
-    tab_momentum, tab_sentiment, tab_conditions, tab_valuation, tab_matrix = st.tabs([
-        "📈 Momentum", "🧠 Sentiment", "💰 Financial Conditions", "📐 Valuation", "🔲 2×2 Matrix"
+    tab_momentum, tab_sentiment, tab_breadth, tab_conditions, tab_valuation, tab_matrix = st.tabs([
+        "📈 Momentum", "🧠 Sentiment", "📊 Breadth", "💰 Financial Conditions", "📐 Valuation", "🔲 2×2 Matrix"
     ])
 
     # ────── MOMENTUM TAB ──────
@@ -812,14 +976,19 @@ def main():
 
         mc1, mc2 = st.columns(2)
 
+        close_filtered = filter_by_date_range(close, chart_days)
+        rsi_filtered = filter_by_date_range(rsi, chart_days)
+        sma_filtered = filter_by_date_range(sma_info["sma_series"], chart_days)
+        dd_filtered = filter_by_date_range(dd_info["series"], chart_days)
+
         with mc1:
             fig = go.Figure()
             fig.add_trace(go.Scatter(
-                x=close.index, y=close.values, name="S&P 500",
+                x=close_filtered.index, y=close_filtered.values, name="S&P 500",
                 line=dict(color="#60a5fa", width=2),
             ))
             fig.add_trace(go.Scatter(
-                x=close.index, y=sma_info["sma_series"].values, name="200 DMA",
+                x=sma_filtered.index, y=sma_filtered.values, name="200 DMA",
                 line=dict(color="#fbbf24", width=1.5, dash="dot"),
             ))
             fig.update_layout(title="S&P 500 vs 200-Day Moving Average", **CHART_LAYOUT)
@@ -828,7 +997,7 @@ def main():
         with mc2:
             fig = go.Figure()
             fig.add_trace(go.Scatter(
-                x=rsi.index, y=rsi.values, name="RSI(14)",
+                x=rsi_filtered.index, y=rsi_filtered.values, name="RSI(14)",
                 line=dict(color="#a78bfa", width=2),
                 fill="tozeroy", fillcolor="rgba(167,139,250,0.08)",
             ))
@@ -840,9 +1009,8 @@ def main():
 
         # Drawdown chart
         fig = go.Figure()
-        dd_series = dd_info["series"]
         fig.add_trace(go.Scatter(
-            x=dd_series.index, y=dd_series.values, name="Drawdown",
+            x=dd_filtered.index, y=dd_filtered.values, name="Drawdown",
             line=dict(color="#f87171", width=1.5),
             fill="tozeroy", fillcolor="rgba(248,113,113,0.1)",
         ))
@@ -865,7 +1033,7 @@ def main():
         with sc1:
             # VIX chart
             if not vix_data.empty:
-                vix_close = vix_data["Close"]
+                vix_close = filter_by_date_range(vix_data["Close"], chart_days)
                 fig = go.Figure()
                 fig.add_trace(go.Scatter(
                     x=vix_close.index, y=vix_close.values, name="VIX",
@@ -982,15 +1150,173 @@ def main():
                 )
                 st.plotly_chart(fig, use_container_width=True)
 
-        # Put/Call ratio placeholder
-        st.markdown("""
-        <div class="metric-card">
-            <div class="metric-label">CBOE Equity Put/Call Ratio</div>
-            <div style="color:#6b7d93; font-family:'DM Sans',sans-serif; font-size:0.85rem; padding:0.5rem 0;">
-                Put/Call ratio data requires CBOE data feed. This indicator will be added in a future update.
+        # Put/Call ratio moved to Breadth tab
+
+    # ────── BREADTH TAB ──────
+    with tab_breadth:
+        st.markdown('<div class="section-header">Market Breadth Indicators (NYSE)</div>', unsafe_allow_html=True)
+
+        # Check if we have any breadth data
+        has_breadth = any(not v.empty for v in breadth_raw.values())
+
+        if not has_breadth:
+            st.markdown("""
+            <div class="metric-card">
+                <div class="metric-label">Breadth Data Unavailable</div>
+                <div style="color:#6b7d93; font-family:'DM Sans',sans-serif; font-size:0.85rem; padding:0.5rem 0;">
+                    NYSE breadth tickers (^MMTH, ^MMFI, ^ADVN, ^DECN, ^HIGX, ^LOWX) could not be loaded from Yahoo Finance.
+                    These tickers may not be available in all regions. Breadth indicators will appear here once data is accessible.
+                </div>
             </div>
-        </div>
-        """, unsafe_allow_html=True)
+            """, unsafe_allow_html=True)
+        else:
+            br1, br2 = st.columns(2)
+
+            # % Above 200 DMA
+            with br1:
+                pct200 = breadth_raw.get("pct_above_200dma", pd.DataFrame())
+                if not pct200.empty:
+                    pct200_f = filter_by_date_range(pct200["Close"], chart_days)
+                    fig = go.Figure()
+                    fig.add_trace(go.Scatter(
+                        x=pct200_f.index, y=pct200_f.values, name="% Above 200 DMA",
+                        line=dict(color="#60a5fa", width=2),
+                        fill="tozeroy", fillcolor="rgba(96,165,250,0.08)",
+                    ))
+                    fig.add_hline(y=50, line_color="#fbbf24", line_dash="dot", line_width=1, annotation_text="50%")
+                    fig.update_layout(title="NYSE % of Stocks Above 200-Day MA", yaxis_title="%", **CHART_LAYOUT)
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    render_metric_card("% Above 200 DMA", "N/A")
+
+            # % Above 50 DMA
+            with br2:
+                pct50 = breadth_raw.get("pct_above_50dma", pd.DataFrame())
+                if not pct50.empty:
+                    pct50_f = filter_by_date_range(pct50["Close"], chart_days)
+                    fig = go.Figure()
+                    fig.add_trace(go.Scatter(
+                        x=pct50_f.index, y=pct50_f.values, name="% Above 50 DMA",
+                        line=dict(color="#a78bfa", width=2),
+                        fill="tozeroy", fillcolor="rgba(167,139,250,0.08)",
+                    ))
+                    fig.add_hline(y=50, line_color="#fbbf24", line_dash="dot", line_width=1, annotation_text="50%")
+                    fig.update_layout(title="NYSE % of Stocks Above 50-Day MA", yaxis_title="%", **CHART_LAYOUT)
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    render_metric_card("% Above 50 DMA", "N/A")
+
+            br3, br4 = st.columns(2)
+
+            # Advance-Decline Line
+            with br3:
+                ad_line = breadth_derived.get("ad_line", pd.Series(dtype=float))
+                if not ad_line.empty:
+                    ad_f = filter_by_date_range(ad_line, chart_days)
+                    fig = go.Figure()
+                    fig.add_trace(go.Scatter(
+                        x=ad_f.index, y=ad_f.values, name="A/D Line",
+                        line=dict(color="#34d399", width=2),
+                    ))
+                    fig.update_layout(title="NYSE Advance-Decline Line (cumulative)", **CHART_LAYOUT)
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    render_metric_card("Advance-Decline Line", "N/A")
+
+            # New Highs minus New Lows
+            with br4:
+                hi_lo = breadth_derived.get("hi_lo_diff", pd.Series(dtype=float))
+                if not hi_lo.empty:
+                    hl_f = filter_by_date_range(hi_lo, chart_days)
+                    colors = ["#34d399" if v > 0 else "#f87171" for v in hl_f.values]
+                    fig = go.Figure()
+                    fig.add_trace(go.Bar(
+                        x=hl_f.index, y=hl_f.values, name="Highs − Lows",
+                        marker_color=colors, opacity=0.7,
+                    ))
+                    # Add smoothed line
+                    hl_ma = hl_f.rolling(10, min_periods=1).mean()
+                    fig.add_trace(go.Scatter(
+                        x=hl_ma.index, y=hl_ma.values, name="10d MA",
+                        line=dict(color="#fbbf24", width=2),
+                    ))
+                    fig.add_hline(y=0, line_color="#f0f4f8", line_width=1)
+                    fig.update_layout(title="NYSE 52-Week New Highs − New Lows", **CHART_LAYOUT)
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    render_metric_card("New Highs − New Lows", "N/A")
+
+            # Breadth Thrust
+            bt = breadth_derived.get("breadth_thrust", pd.Series(dtype=float))
+            if not bt.empty:
+                bt_f = filter_by_date_range(bt, chart_days)
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(
+                    x=bt_f.index, y=bt_f.values * 100, name="Breadth Thrust",
+                    line=dict(color="#38bdf8", width=2),
+                    fill="tozeroy", fillcolor="rgba(56,189,248,0.08)",
+                ))
+                fig.add_hline(y=61.5, line_color="#34d399", line_dash="dash", line_width=1, annotation_text="Bullish thrust (>61.5%)")
+                fig.add_hline(y=40, line_color="#f87171", line_dash="dash", line_width=1, annotation_text="Weak breadth (<40%)")
+                fig.add_hline(y=50, line_color="#334155", line_dash="dot", line_width=1)
+                fig.update_layout(
+                    title="Zweig Breadth Thrust — 10-Day EMA of Advancing / (Advancing + Declining) %",
+                    yaxis_title="%",
+                    yaxis_range=[20, 85],
+                    **CHART_LAYOUT,
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+                st.markdown("""
+                <div style="font-family:'DM Sans',sans-serif; font-size:0.78rem; color:#6b7d93; margin-top:0.3rem;">
+                    Zweig Breadth Thrust: a reading that moves from below 40% to above 61.5% within 10 trading days
+                    signals rare but powerful bullish momentum. These signals have historically preceded strong market advances.
+                </div>
+                """, unsafe_allow_html=True)
+            else:
+                render_metric_card("Breadth Thrust", "N/A")
+
+        # Put/Call Ratio section within Breadth tab
+        st.markdown('<div class="section-header" style="margin-top:1rem">CBOE Put/Call Ratio</div>', unsafe_allow_html=True)
+
+        if not putcall_df.empty:
+            pc_filtered = filter_by_date_range(putcall_df, chart_days, date_col="date")
+
+            if not pc_filtered.empty:
+                latest_pc = pc_filtered["pc_ratio"].iloc[-1]
+                pc_signal = "BULLISH" if latest_pc > 1.0 else ("BEARISH" if latest_pc < 0.7 else "NEUTRAL")
+                pc_class = "signal-bullish" if pc_signal == "BULLISH" else ("signal-bearish" if pc_signal == "BEARISH" else "signal-neutral")
+
+                pc1, pc2 = st.columns([1, 3])
+                with pc1:
+                    render_metric_card("Put/Call Ratio", f"{latest_pc:.2f}",
+                                      signal=f"{pc_signal} (contrarian)",
+                                      signal_class=pc_class)
+                with pc2:
+                    fig = go.Figure()
+                    fig.add_trace(go.Scatter(
+                        x=pc_filtered["date"], y=pc_filtered["pc_ratio"], name="P/C Ratio",
+                        line=dict(color="#f59e0b", width=1.5),
+                    ))
+                    # 10-day moving average
+                    pc_ma = pc_filtered["pc_ratio"].rolling(10, min_periods=1).mean()
+                    fig.add_trace(go.Scatter(
+                        x=pc_filtered["date"], y=pc_ma, name="10d MA",
+                        line=dict(color="#60a5fa", width=2),
+                    ))
+                    fig.add_hline(y=1.0, line_color="#34d399", line_dash="dash", line_width=1, annotation_text="High fear (>1.0)")
+                    fig.add_hline(y=0.7, line_color="#f87171", line_dash="dash", line_width=1, annotation_text="Complacency (<0.7)")
+                    fig.update_layout(title="CBOE Total Put/Call Ratio (contrarian indicator)", **CHART_LAYOUT)
+                    st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.markdown("""
+            <div class="metric-card">
+                <div class="metric-label">CBOE Put/Call Ratio</div>
+                <div style="color:#6b7d93; font-family:'DM Sans',sans-serif; font-size:0.85rem; padding:0.5rem 0;">
+                    Could not fetch CBOE put/call data. The CBOE CSV endpoint may be temporarily unavailable.
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
 
     # ────── FINANCIAL CONDITIONS TAB ──────
     with tab_conditions:
@@ -1030,9 +1356,10 @@ def main():
 
             with cc1:
                 if not hy_spread.empty:
+                    hy_f = filter_by_date_range(hy_spread, chart_days)
                     fig = go.Figure()
                     fig.add_trace(go.Scatter(
-                        x=hy_spread.index, y=hy_spread.values, name="HY OAS",
+                        x=hy_f.index, y=hy_f.values, name="HY OAS",
                         line=dict(color="#fb923c", width=2),
                         fill="tozeroy", fillcolor="rgba(251,146,60,0.08)",
                     ))
@@ -1043,10 +1370,11 @@ def main():
                 if not dgs2.empty and not dgs10.empty:
                     curve = dgs10 - dgs2
                     curve = curve.dropna()
+                    curve_f = filter_by_date_range(curve, chart_days)
                     fig = go.Figure()
-                    colors = ["#34d399" if v > 0 else "#f87171" for v in curve.values]
+                    colors = ["#34d399" if v > 0 else "#f87171" for v in curve_f.values]
                     fig.add_trace(go.Bar(
-                        x=curve.index, y=curve.values, name="2y/10y Spread",
+                        x=curve_f.index, y=curve_f.values, name="2y/10y Spread",
                         marker_color=colors, opacity=0.7,
                     ))
                     fig.add_hline(y=0, line_color="#f0f4f8", line_width=1)
@@ -1054,9 +1382,10 @@ def main():
                     st.plotly_chart(fig, use_container_width=True)
 
             if not nfci.empty:
+                nfci_f = filter_by_date_range(nfci, chart_days)
                 fig = go.Figure()
                 fig.add_trace(go.Scatter(
-                    x=nfci.index, y=nfci.values, name="NFCI",
+                    x=nfci_f.index, y=nfci_f.values, name="NFCI",
                     line=dict(color="#a78bfa", width=2),
                     fill="tozeroy", fillcolor="rgba(167,139,250,0.08)",
                 ))
@@ -1084,7 +1413,7 @@ def main():
         """, unsafe_allow_html=True)
 
         if not dxy_data.empty:
-            dxy_close = dxy_data["Close"]
+            dxy_close = filter_by_date_range(dxy_data["Close"], chart_days)
             fig = go.Figure()
             fig.add_trace(go.Scatter(
                 x=dxy_close.index, y=dxy_close.values, name="DXY",
