@@ -333,37 +333,30 @@ def load_aaii_history() -> pd.DataFrame:
 def fetch_sp500_constituents(_fmp_key: str = "") -> list:
     """
     Get S&P 500 constituent tickers.
-    Primary source: Wikipedia (free, no API key needed).
-    Fallback: FMP API if available.
+    Primary source: bundled CSV file (always available, no network needed).
+    The CSV can be updated periodically by re-downloading from Wikipedia.
     """
-    # Primary: Wikipedia
+    # Primary: bundled CSV file
+    csv_path = os.path.join(os.path.dirname(__file__), "sp500_tickers.csv")
     try:
-        url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-        tables = pd.read_html(url)
+        df = pd.read_csv(csv_path)
+        symbols = df["symbol"].tolist()
+        if len(symbols) > 400:
+            return symbols
+    except Exception:
+        pass
+
+    # Fallback: Wikipedia (in case CSV is missing)
+    try:
+        tables = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
         if tables and len(tables) > 0:
             df = tables[0]
-            # The "Symbol" column contains tickers; dots need to become dashes for yfinance
             symbols = df["Symbol"].str.replace(".", "-", regex=False).tolist()
             symbols = [s for s in symbols if isinstance(s, str) and 0 < len(s) < 10]
             if len(symbols) > 400:
                 return symbols
     except Exception:
         pass
-
-    # Fallback: FMP API
-    if _fmp_key:
-        for base in [
-            f"https://financialmodelingprep.com/api/v3/sp500_constituent?apikey={_fmp_key}",
-            f"https://financialmodelingprep.com/stable/sp500-constituent?apikey={_fmp_key}",
-        ]:
-            try:
-                resp = requests.get(base, timeout=15)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    if isinstance(data, list) and len(data) > 0:
-                        return [item["symbol"] for item in data if "symbol" in item]
-            except Exception:
-                continue
 
     return []
 
