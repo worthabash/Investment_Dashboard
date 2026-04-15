@@ -269,9 +269,9 @@ st.markdown("""
 MARKET_CONFIGS = {
     "S&P 500": {
         # Twelve Data symbols
-        "td_index_symbol": "SPX",        # S&P 500 index
-        "td_vix_symbol":   "VIX",        # CBOE VIX
-        "td_dxy_symbol":   "DX-Y.NYB",   # DXY (USD index)
+        "td_index_symbol": "SPX",        # S&P 500 index (Twelve Data index symbol)
+        "td_vix_symbol":   "^VIX",       # CBOE VIX — caret prefix required for CBOE indices
+        "td_dxy_symbol":   "DX",         # US Dollar Index futures (ICE) — Twelve Data symbol
         # FMP
         "fmp_index_symbol": "^GSPC",
         # FRED series
@@ -300,6 +300,11 @@ def fetch_td_price(symbol: str, api_key: str, days: int = 730) -> pd.DataFrame:
     Fetch daily OHLCV from Twelve Data for a single symbol.
     Returns a DataFrame with DatetimeIndex and columns [Open, High, Low, Close, Volume].
     days: approx calendar days of history to request.
+
+    Symbol notes:
+      - S&P 500 index: "SPX"
+      - CBOE VIX:      "^VIX"   (caret prefix required)
+      - USD Index:     "DX"     (ICE futures, no exchange param needed)
     """
     if not api_key:
         return pd.DataFrame()
@@ -307,12 +312,12 @@ def fetch_td_price(symbol: str, api_key: str, days: int = 730) -> pd.DataFrame:
         outputsize = _td_outputsize(days)
         url = "https://api.twelvedata.com/time_series"
         params = {
-            "symbol":      symbol,
-            "interval":    "1day",
-            "outputsize":  outputsize,
-            "order":       "ASC",
-            "apikey":      api_key,
-            "type":        "Common Stock",  # ignored for indices, but harmless
+            "symbol":     symbol,
+            "interval":   "1day",
+            "outputsize": outputsize,
+            "order":      "ASC",
+            "apikey":     api_key,
+            # Note: do NOT pass "type" param — it is invalid for indices and futures
         }
         resp = requests.get(url, params=params, timeout=15)
         resp.raise_for_status()
@@ -456,37 +461,32 @@ def fetch_sp500_constituents_fmp(fmp_key: str = "") -> list:
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_fmp_valuation(fmp_key: str) -> dict:
     """
-    Fetch S&P 500 (SPY) trailing P/E and forward P/E from FMP.
-    Uses /quote endpoint for trailing P/E and /key-metrics for forward P/E.
+    Fetch S&P 500 (SPY) trailing P/E from FMP using the /v3/ratios-ttm endpoint,
+    which is available on the Starter plan ($19/mo).
+
+    NOTE: /v3/quote/{symbol} requires a higher FMP plan and returns 403 on Starter.
+    /v3/ratios-ttm/{symbol} returns peRatio (trailing P/E) on Starter.
+    Forward P/E for the broader index is not cleanly available via FMP Starter;
+    it falls back to the sidebar manual entry or is left as N/A.
     """
     if not fmp_key:
         return {"available": False}
     try:
-        # Quote for trailing P/E and basic info
-        quote_url = f"https://financialmodelingprep.com/api/v3/quote/SPY?apikey={fmp_key}"
-        quote_resp = requests.get(quote_url, timeout=10)
-        quote_resp.raise_for_status()
-        quote_data = quote_resp.json()
+        # ratios-ttm is available on Starter plan and contains peRatio
+        url = f"https://financialmodelingprep.com/api/v3/ratios-ttm/SPY?apikey={fmp_key}"
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
 
         trailing_pe = None
-        if isinstance(quote_data, list) and quote_data:
-            trailing_pe = quote_data[0].get("pe", None)
+        if isinstance(data, list) and data:
+            trailing_pe = data[0].get("peRatioTTM", None) or data[0].get("priceEarningsRatioTTM", None)
             if trailing_pe:
                 trailing_pe = float(trailing_pe)
 
-        # Key metrics (TTM) for forward P/E
-        km_url = f"https://financialmodelingprep.com/api/v3/key-metrics/SPY?period=annual&limit=1&apikey={fmp_key}"
-        km_resp = requests.get(km_url, timeout=10)
-        km_resp.raise_for_status()
-        km_data = km_resp.json()
-
+        # Forward P/E: FMP Starter doesn't have a dedicated forward P/E index endpoint.
+        # Users should enter it manually via the sidebar, or upgrade to Premium for analyst estimates.
         forward_pe = None
-        if isinstance(km_data, list) and km_data:
-            # FMP doesn't provide a dedicated forward P/E in key-metrics, use peRatio as trailing
-            # Forward P/E is better sourced from the index earnings yield
-            forward_pe = km_data[0].get("forwardPE", None)
-            if forward_pe:
-                forward_pe = float(forward_pe)
 
         earnings_yield = (1 / trailing_pe * 100) if trailing_pe and trailing_pe > 0 else None
 
