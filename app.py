@@ -20,6 +20,7 @@ from fredapi import Fred
 from datetime import datetime, timedelta
 import requests
 import os
+import time
 import warnings
 
 warnings.filterwarnings("ignore")
@@ -344,28 +345,34 @@ def fetch_td_batch_closes(symbols: tuple, api_key: str, days: int = 730) -> pd.D
     """
     Fetch daily close prices for S&P 500 constituents from Twelve Data.
 
-    Twelve Data Growth plan limits:
-      - Max 8 symbols per batch call (not 120 — that requires a higher tier)
-      - Max outputsize varies by plan; Growth supports up to 5000 but
-        we cap at 800 (~3yr) to stay within per-minute credit limits
-      - 800 API credits/minute; each symbol in a batch = 1 credit
+    Credit budget (Growth plan = 800 credits/minute):
+      - Each symbol in a batch call = 1 credit
+      - chunk_size=8 → 8 credits per call
+      - PAUSE_EVERY controls how many chunks fire before we sleep 60s
+        to let the per-minute counter reset.
+      - With chunk_size=8 and PAUSE_EVERY=6 we use 48 credits then pause,
+        well under the 55-credit safe limit observed in production.
+      - SPX is fetched separately before this function is called, so it
+        never competes with breadth for the per-minute budget.
 
     Returns a DataFrame: index=dates, columns=symbols.
     """
     if not api_key or not symbols:
         return pd.DataFrame()
 
-    # Cap outputsize: 5yr = ~1260 trading days. Use 1300 with buffer.
-    # If your plan blocks large outputsizes this will surface as an error below.
-    outputsize = min(_td_outputsize(days), 1300)
-
-    # Use small chunks — Growth plan batch limit is typically 8 symbols.
-    # If you're on a higher plan and want to increase this, do so carefully.
-    chunk_size  = 8
+    outputsize  = min(_td_outputsize(days), 1300)
+    chunk_size  = 8    # symbols per API call
+    PAUSE_EVERY = 6    # pause after this many chunks (48 credits), then reset
     all_closes: dict[str, pd.Series] = {}
     errors_seen: list[str] = []
 
     for i in range(0, len(symbols), chunk_size):
+        chunk_num  = i // chunk_size
+
+        # Pause every PAUSE_EVERY chunks to stay under the per-minute limit
+        if chunk_num > 0 and chunk_num % PAUSE_EVERY == 0:
+            time.sleep(62)  # wait just over 60s for the credit counter to reset
+
         chunk      = list(symbols[i : i + chunk_size])
         symbol_str = ",".join(chunk)
         try:
@@ -381,15 +388,15 @@ def fetch_td_batch_closes(symbols: tuple, api_key: str, days: int = 730) -> pd.D
             resp.raise_for_status()
             data = resp.json()
 
-            # Top-level error means the whole request failed (auth, plan limit, etc.)
+            # Top-level error means the whole request failed
             if isinstance(data, dict) and data.get("status") == "error":
                 msg = data.get("message", "unknown error")
                 if msg not in errors_seen:
                     errors_seen.append(msg)
                     st.warning(f"Twelve Data batch error: {msg}")
-                break  # no point continuing if the API is rejecting us
+                break
 
-            # Single-symbol response (no comma in symbol_str)
+            # Single-symbol response
             if len(chunk) == 1:
                 sym = chunk[0]
                 if data.get("status") == "error" or "values" not in data:
@@ -400,7 +407,7 @@ def fetch_td_batch_closes(symbols: tuple, api_key: str, days: int = 730) -> pd.D
                 df_s["close"] = pd.to_numeric(df_s["close"], errors="coerce")
                 all_closes[sym] = df_s["close"].rename(sym)
             else:
-                # Multi-symbol response is a dict keyed by symbol
+                # Multi-symbol response keyed by symbol
                 for sym in chunk:
                     series_data = data.get(sym, {})
                     if not isinstance(series_data, dict):
@@ -898,13 +905,16 @@ def main():
             nfci       = fetch_fred_series(market["fred_nfci"], fred_key)
 
         # Breadth: sp500_tickers.csv for constituents, Twelve Data for prices
+        # Small sleep ensures SPX + FRED calls don't eat into the breadth
+        # per-minute credit budget (Growth plan = 55 safe credits/minute).
+        time.sleep(3)
         breadth_data  = {}
         sp500_closes  = pd.DataFrame()
         breadth_debug = ""
         constituents  = fetch_sp500_constituents()
         if constituents:
             breadth_debug = f"Found {len(constituents)} constituents. Downloading prices via Twelve Data..."
-            # Twelve Data Growth plan: batch to avoid credit exhaustion
+            # Twelve Data Growth plan: batch with pacing — see fetch_td_batch_closes
             sp500_closes = fetch_td_batch_closes(tuple(constituents), td_key, days=PRICE_DAYS)
             if not sp500_closes.empty:
                 breadth_data  = compute_breadth_from_prices(sp500_closes)
