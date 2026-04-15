@@ -6,7 +6,7 @@ Composite signal with 2×2 matrix logic and drawdown regime classification.
 
 Data sources:
   - Twelve Data  → S&P 500, VIX, DXY, individual stock prices (breadth)
-  - FMP          → S&P 500 constituent list, forward P/E / valuation
+  - sp500_tickers.csv → S&P 500 constituent list (auto-updated by GitHub Action)
   - FRED API     → HY spread, yield curve, NFCI
   - Bundled CSVs → AAII sentiment history, Shiller CAPE history
 """
@@ -342,21 +342,31 @@ def fetch_td_price(symbol: str, api_key: str, days: int = 730) -> pd.DataFrame:
 @st.cache_data(ttl=3600, show_spinner="Loading S&P 500 breadth data (Twelve Data)...")
 def fetch_td_batch_closes(symbols: tuple, api_key: str, days: int = 730) -> pd.DataFrame:
     """
-    Fetch daily close prices for a batch of symbols from Twelve Data.
-    Uses the /time_series endpoint sequentially (Growth plan = 800 API credits/min).
-    Twelve Data batch endpoint supports up to 120 symbols per call — we chunk to stay safe.
+    Fetch daily close prices for S&P 500 constituents from Twelve Data.
+
+    Twelve Data Growth plan limits:
+      - Max 8 symbols per batch call (not 120 — that requires a higher tier)
+      - Max outputsize varies by plan; Growth supports up to 5000 but
+        we cap at 800 (~3yr) to stay within per-minute credit limits
+      - 800 API credits/minute; each symbol in a batch = 1 credit
 
     Returns a DataFrame: index=dates, columns=symbols.
     """
     if not api_key or not symbols:
         return pd.DataFrame()
 
-    outputsize = _td_outputsize(days)
-    chunk_size = 120  # max symbols per batch call
+    # Cap outputsize: 5yr = ~1260 trading days. Use 1300 with buffer.
+    # If your plan blocks large outputsizes this will surface as an error below.
+    outputsize = min(_td_outputsize(days), 1300)
+
+    # Use small chunks — Growth plan batch limit is typically 8 symbols.
+    # If you're on a higher plan and want to increase this, do so carefully.
+    chunk_size  = 8
     all_closes: dict[str, pd.Series] = {}
+    errors_seen: list[str] = []
 
     for i in range(0, len(symbols), chunk_size):
-        chunk = list(symbols[i : i + chunk_size])
+        chunk      = list(symbols[i : i + chunk_size])
         symbol_str = ",".join(chunk)
         try:
             url = "https://api.twelvedata.com/time_series"
@@ -371,21 +381,30 @@ def fetch_td_batch_closes(symbols: tuple, api_key: str, days: int = 730) -> pd.D
             resp.raise_for_status()
             data = resp.json()
 
-            # When multiple symbols, response is a dict keyed by symbol.
-            # When a single symbol, response is the series object directly.
+            # Top-level error means the whole request failed (auth, plan limit, etc.)
+            if isinstance(data, dict) and data.get("status") == "error":
+                msg = data.get("message", "unknown error")
+                if msg not in errors_seen:
+                    errors_seen.append(msg)
+                    st.warning(f"Twelve Data batch error: {msg}")
+                break  # no point continuing if the API is rejecting us
+
+            # Single-symbol response (no comma in symbol_str)
             if len(chunk) == 1:
                 sym = chunk[0]
-                series_data = data
-                if series_data.get("status") == "error" or "values" not in series_data:
+                if data.get("status") == "error" or "values" not in data:
                     continue
-                df_s = pd.DataFrame(series_data["values"])
+                df_s = pd.DataFrame(data["values"])
                 df_s["datetime"] = pd.to_datetime(df_s["datetime"])
                 df_s = df_s.set_index("datetime").sort_index()
                 df_s["close"] = pd.to_numeric(df_s["close"], errors="coerce")
                 all_closes[sym] = df_s["close"].rename(sym)
             else:
+                # Multi-symbol response is a dict keyed by symbol
                 for sym in chunk:
                     series_data = data.get(sym, {})
+                    if not isinstance(series_data, dict):
+                        continue
                     if series_data.get("status") == "error" or "values" not in series_data:
                         continue
                     df_s = pd.DataFrame(series_data["values"])
@@ -394,7 +413,8 @@ def fetch_td_batch_closes(symbols: tuple, api_key: str, days: int = 730) -> pd.D
                     df_s["close"] = pd.to_numeric(df_s["close"], errors="coerce")
                     all_closes[sym] = df_s["close"].rename(sym)
 
-        except Exception:
+        except Exception as e:
+            st.warning(f"Twelve Data batch chunk {i}–{i+chunk_size} failed: {e}")
             continue
 
     if not all_closes:
@@ -406,32 +426,22 @@ def fetch_td_batch_closes(symbols: tuple, api_key: str, days: int = 730) -> pd.D
 
 
 # ──────────────────────────────────────────────
-# FMP — CONSTITUENTS & VALUATION
+# S&P 500 CONSTITUENTS
+# Primary:  bundled sp500_tickers.csv (updated daily by GitHub Action)
+# Fallback: Wikipedia live scrape (emergency only)
+# No API key required.
 # ──────────────────────────────────────────────
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def fetch_sp500_constituents_fmp(fmp_key: str = "") -> list:
+def fetch_sp500_constituents() -> list:
     """
-    Get S&P 500 constituent tickers.
-    Primary: FMP /sp500_constituent endpoint.
-    Fallback 1: bundled sp500_tickers.csv.
-    Fallback 2: Wikipedia.
-    Returns list of Twelve-Data-compatible symbols (dots → dashes).
+    Load S&P 500 constituent tickers.
+    Primary source: sp500_tickers.csv in the repo, refreshed daily by
+    the GitHub Actions workflow (.github/workflows/update_sp500.yml).
+    Fallback: live Wikipedia scrape if the CSV is missing or too small.
+    Returns list of Twelve-Data-compatible symbols (dots replaced with dashes).
     """
-    # Primary: FMP stable API (new endpoint as of Sept 2025 — /api/v3/ is legacy-only)
-    if fmp_key:
-        try:
-            url = f"https://financialmodelingprep.com/stable/sp500-constituent?apikey={fmp_key}"
-            resp = requests.get(url, timeout=15)
-            resp.raise_for_status()
-            data = resp.json()
-            if isinstance(data, list) and len(data) > 400:
-                symbols = [d["symbol"].replace(".", "-") for d in data if "symbol" in d]
-                return symbols
-        except Exception:
-            pass
-
-    # Fallback 1: bundled CSV
+    # Primary: bundled CSV (fast, no network call at runtime)
     csv_path = os.path.join(os.path.dirname(__file__), "sp500_tickers.csv")
     try:
         df = pd.read_csv(csv_path)
@@ -441,7 +451,7 @@ def fetch_sp500_constituents_fmp(fmp_key: str = "") -> list:
     except Exception:
         pass
 
-    # Fallback 2: Wikipedia
+    # Fallback: Wikipedia (used only if CSV is missing or corrupted)
     try:
         tables = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
         if tables:
@@ -456,20 +466,9 @@ def fetch_sp500_constituents_fmp(fmp_key: str = "") -> list:
     return []
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_fmp_valuation(fmp_key: str) -> dict:
-    """
-    FMP Starter plan ($19/mo) returns 403 on all SPY/ETF financial statement
-    and ratio endpoints (/v3/ratios-ttm, /v3/quote, /v3/key-metrics).
-    These require Premium or higher.
-
-    Trailing/Forward P/E is therefore sidebar-entry only.
-    FMP is still used for the S&P 500 constituent list (fetch_sp500_constituents_fmp),
-    which works fine on Starter.
-    """
+def fetch_fmp_valuation() -> dict:
+    """FMP removed — P/E is sidebar-entry only via manual input."""
     return {"available": False}
-
-
 # ──────────────────────────────────────────────
 # FRED — FINANCIAL CONDITIONS
 # ──────────────────────────────────────────────
@@ -852,7 +851,6 @@ def main():
 
     # ── API Keys ──
     fred_key    = st.secrets.get("FRED_API_KEY", "")
-    fmp_key     = st.secrets.get("FMP_API_KEY", "")
     td_key      = st.secrets.get("TWELVE_DATA_API_KEY", "")
 
     if not fred_key:
@@ -899,11 +897,11 @@ def main():
             dgs10      = fetch_fred_series(market["fred_yield_curve"]["10y"], fred_key)
             nfci       = fetch_fred_series(market["fred_nfci"], fred_key)
 
-        # Breadth: FMP for constituents, Twelve Data for prices
+        # Breadth: sp500_tickers.csv for constituents, Twelve Data for prices
         breadth_data  = {}
         sp500_closes  = pd.DataFrame()
         breadth_debug = ""
-        constituents  = fetch_sp500_constituents_fmp(fmp_key)
+        constituents  = fetch_sp500_constituents()
         if constituents:
             breadth_debug = f"Found {len(constituents)} constituents. Downloading prices via Twelve Data..."
             # Twelve Data Growth plan: batch to avoid credit exhaustion
@@ -914,11 +912,11 @@ def main():
             else:
                 breadth_debug = f"Got {len(constituents)} constituents but Twelve Data returned no price data."
         else:
-            breadth_debug = f"Could not fetch constituent list. FMP key set: {bool(fmp_key)}."
+            breadth_debug = "Could not load constituent list from CSV or Wikipedia."
 
-        # Valuation: FMP for P/E, bundled CSV for CAPE
+        # Valuation: sidebar manual entry for P/E, bundled CSV for CAPE
         shiller_df  = fetch_shiller_cape()
-        spy_pe_info = fetch_fmp_valuation(fmp_key) if fmp_key else {"available": False}
+        spy_pe_info = fetch_fmp_valuation()
 
     if spx_data.empty:
         st.error("Could not fetch S&P 500 data from Twelve Data. Check your API key and try again.")
@@ -1160,7 +1158,7 @@ def main():
                 <div class="metric-label">Breadth Data Unavailable</div>
                 <div style="color:#6b7d93; font-family:'DM Sans',sans-serif; font-size:0.85rem; padding:0.5rem 0;">
                     Could not load S&P 500 constituent price data from Twelve Data.<br>
-                    Try refreshing. This tab requires valid FMP and Twelve Data API keys.<br><br>
+                    Try refreshing. This tab requires a valid Twelve Data API key.<br><br>
                     <strong>Debug:</strong> {breadth_debug}
                 </div>
             </div>""", unsafe_allow_html=True)
@@ -1168,7 +1166,7 @@ def main():
             n_stocks = breadth_data.get("n_stocks", 500)
             st.markdown(f"""
             <div style="font-family:'DM Sans',sans-serif; font-size:0.75rem; color:#6b7d93; margin-bottom:0.5rem;">
-                Computed from {n_stocks} S&P 500 constituents · Source: FMP (constituent list) + Twelve Data (prices)
+                Computed from {n_stocks} S&P 500 constituents · Source: sp500_tickers.csv (auto-updated daily) + Twelve Data (prices)
             </div>""", unsafe_allow_html=True)
 
             br1, br2 = st.columns(2)
@@ -1340,7 +1338,7 @@ def main():
             if forward_pe:
                 fwd_signal = "BEARISH" if forward_pe > 22 else ("BULLISH" if forward_pe < 16 else "NEUTRAL")
                 fwd_class  = "signal-bullish" if fwd_signal == "BULLISH" else ("signal-bearish" if fwd_signal == "BEARISH" else "signal-neutral")
-                source     = "manual" if val_manual.get("manual_fwd_pe") else "FMP"
+                source     = "manual"
                 render_metric_card("Forward P/E", f"{forward_pe:.1f}",
                                    delta=f"{'▲' if forward_pe > 18 else '▼'} vs 18 avg · {source}",
                                    signal=fwd_signal, signal_class=fwd_class)
@@ -1429,7 +1427,7 @@ def main():
             <strong>Trailing P/E</strong> and <strong>Forward P/E</strong> — enter manually via the sidebar (☰).
             Suggested sources: <a href="https://www.multpl.com/s-p-500-pe-ratio" target="_blank" style="color:#60a5fa">multpl.com</a>
             or <a href="https://yardeni.com/charts/sp-500-sectors-forward-p-e-ratios/" target="_blank" style="color:#60a5fa">Yardeni</a>.
-            FMP Starter plan does not expose SPY ratio endpoints (requires Premium+).
+
             <strong>Shiller CAPE</strong> from bundled CSV — update periodically from multpl.com.
             Valuation indicators are slow-moving — best used as long-term context, not timing signals.
         </div>""", unsafe_allow_html=True)
