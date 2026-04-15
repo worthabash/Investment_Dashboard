@@ -1,0 +1,68 @@
+name: Update S&P 500 Tickers
+
+on:
+  schedule:
+    - cron: "0 6 * * 1-5"   # 6am UTC, Monday–Friday (after index changes are published)
+  workflow_dispatch:          # also allows manual trigger from GitHub Actions tab
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install pandas lxml html5lib requests
+
+      - name: Fetch S&P 500 constituent list from Wikipedia
+        run: |
+          python - <<'EOF'
+          import pandas as pd
+          import sys
+
+          url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+          try:
+              tables = pd.read_html(url)
+          except Exception as e:
+              print(f"ERROR: Could not fetch Wikipedia table: {e}")
+              sys.exit(1)
+
+          df = tables[0]
+          print(f"Columns found: {list(df.columns)}")
+
+          # Wikipedia table column is "Symbol"
+          if "Symbol" not in df.columns:
+              print(f"ERROR: 'Symbol' column not found. Columns: {list(df.columns)}")
+              sys.exit(1)
+
+          symbols = df["Symbol"].str.replace(".", "-", regex=False).tolist()
+          symbols = [s for s in symbols if isinstance(s, str) and 0 < len(s) < 10]
+
+          if len(symbols) < 490:
+              print(f"ERROR: Only got {len(symbols)} symbols — expected 490+. Aborting to preserve existing CSV.")
+              sys.exit(1)
+
+          out = pd.DataFrame({"symbol": sorted(symbols)})
+          out.to_csv("sp500_tickers.csv", index=False)
+          print(f"SUCCESS: Wrote {len(symbols)} symbols to sp500_tickers.csv")
+          EOF
+
+      - name: Commit updated CSV if changed
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add sp500_tickers.csv
+          if git diff --staged --quiet; then
+            echo "No changes to sp500_tickers.csv — nothing to commit."
+          else
+            COUNT=$(wc -l < sp500_tickers.csv)
+            git commit -m "chore: update S&P 500 tickers ($COUNT symbols) [skip ci]"
+            git push
+          fi
