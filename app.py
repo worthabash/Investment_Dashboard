@@ -268,16 +268,14 @@ st.markdown("""
 # ──────────────────────────────────────────────
 MARKET_CONFIGS = {
     "S&P 500": {
-        # Twelve Data symbols
-        "td_index_symbol": "SPX",        # S&P 500 index (Twelve Data index symbol)
-        "td_vix_symbol":   "^VIX",       # CBOE VIX — caret prefix required for CBOE indices
-        "td_dxy_symbol":   "DX",         # US Dollar Index futures (ICE) — Twelve Data symbol
-        # FMP
-        "fmp_index_symbol": "^GSPC",
-        # FRED series
-        "fred_hy_spread":  "BAMLH0A0HYM2",
+        # Twelve Data — used only for equity/ETF price data (indices not supported on Growth plan)
+        "td_index_symbol": "SPX",
+        # FRED series — free tier, no plan restrictions, used for VIX, DXY, and conditions
+        "fred_vix":         "VIXCLS",       # CBOE VIX daily close (1990-present)
+        "fred_dxy":         "DTWEXBGS",     # Fed Broad USD Index daily (2006-present)
+        "fred_hy_spread":   "BAMLH0A0HYM2", # HY OAS spread
         "fred_yield_curve": {"2y": "DGS2", "10y": "DGS10"},
-        "fred_nfci":       "NFCI",
+        "fred_nfci":        "NFCI",
         "label":    "S&P 500",
         "currency": "USD",
     },
@@ -420,10 +418,10 @@ def fetch_sp500_constituents_fmp(fmp_key: str = "") -> list:
     Fallback 2: Wikipedia.
     Returns list of Twelve-Data-compatible symbols (dots → dashes).
     """
-    # Primary: FMP
+    # Primary: FMP stable API (new endpoint as of Sept 2025 — /api/v3/ is legacy-only)
     if fmp_key:
         try:
-            url = f"https://financialmodelingprep.com/api/v3/sp500_constituent?apikey={fmp_key}"
+            url = f"https://financialmodelingprep.com/stable/sp500-constituent?apikey={fmp_key}"
             resp = requests.get(url, timeout=15)
             resp.raise_for_status()
             data = resp.json()
@@ -461,44 +459,15 @@ def fetch_sp500_constituents_fmp(fmp_key: str = "") -> list:
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_fmp_valuation(fmp_key: str) -> dict:
     """
-    Fetch S&P 500 (SPY) trailing P/E from FMP using the /v3/ratios-ttm endpoint,
-    which is available on the Starter plan ($19/mo).
+    FMP Starter plan ($19/mo) returns 403 on all SPY/ETF financial statement
+    and ratio endpoints (/v3/ratios-ttm, /v3/quote, /v3/key-metrics).
+    These require Premium or higher.
 
-    NOTE: /v3/quote/{symbol} requires a higher FMP plan and returns 403 on Starter.
-    /v3/ratios-ttm/{symbol} returns peRatio (trailing P/E) on Starter.
-    Forward P/E for the broader index is not cleanly available via FMP Starter;
-    it falls back to the sidebar manual entry or is left as N/A.
+    Trailing/Forward P/E is therefore sidebar-entry only.
+    FMP is still used for the S&P 500 constituent list (fetch_sp500_constituents_fmp),
+    which works fine on Starter.
     """
-    if not fmp_key:
-        return {"available": False}
-    try:
-        # ratios-ttm is available on Starter plan and contains peRatio
-        url = f"https://financialmodelingprep.com/api/v3/ratios-ttm/SPY?apikey={fmp_key}"
-        resp = requests.get(url, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-
-        trailing_pe = None
-        if isinstance(data, list) and data:
-            trailing_pe = data[0].get("peRatioTTM", None) or data[0].get("priceEarningsRatioTTM", None)
-            if trailing_pe:
-                trailing_pe = float(trailing_pe)
-
-        # Forward P/E: FMP Starter doesn't have a dedicated forward P/E index endpoint.
-        # Users should enter it manually via the sidebar, or upgrade to Premium for analyst estimates.
-        forward_pe = None
-
-        earnings_yield = (1 / trailing_pe * 100) if trailing_pe and trailing_pe > 0 else None
-
-        return {
-            "available": True,
-            "trailing_pe": trailing_pe,
-            "forward_pe": forward_pe,
-            "earnings_yield": earnings_yield,
-        }
-    except Exception as e:
-        st.warning(f"FMP valuation fetch failed: {e}")
-        return {"available": False}
+    return {"available": False}
 
 
 # ──────────────────────────────────────────────
@@ -910,22 +879,25 @@ def main():
 
     # ── Fetch core price data (5-year history) ──
     with st.spinner("Fetching market data from Twelve Data & FRED..."):
-        PRICE_DAYS = 1825  # 5 years — Twelve Data handles this without rate-limiting
+        PRICE_DAYS = 1825  # 5 years
 
         spx_data = fetch_td_price(market["td_index_symbol"], td_key, days=PRICE_DAYS)
-        vix_data = fetch_td_price(market["td_vix_symbol"],   td_key, days=PRICE_DAYS)
-        dxy_data = fetch_td_price(market["td_dxy_symbol"],   td_key, days=PRICE_DAYS)
 
-        # FRED financial conditions
-        hy_spread = pd.Series(dtype=float)
-        dgs2      = pd.Series(dtype=float)
-        dgs10     = pd.Series(dtype=float)
-        nfci      = pd.Series(dtype=float)
+        # VIX and DXY come from FRED — free, reliable, no plan restrictions.
+        # (Twelve Data Growth plan does not support CBOE/index-only symbols like VIX.)
+        vix_series = pd.Series(dtype=float)
+        dxy_series = pd.Series(dtype=float)
+        hy_spread  = pd.Series(dtype=float)
+        dgs2       = pd.Series(dtype=float)
+        dgs10      = pd.Series(dtype=float)
+        nfci       = pd.Series(dtype=float)
         if fred_key:
-            hy_spread = fetch_fred_series(market["fred_hy_spread"], fred_key)
-            dgs2      = fetch_fred_series(market["fred_yield_curve"]["2y"], fred_key)
-            dgs10     = fetch_fred_series(market["fred_yield_curve"]["10y"], fred_key)
-            nfci      = fetch_fred_series(market["fred_nfci"], fred_key)
+            vix_series = fetch_fred_series(market["fred_vix"],  fred_key)
+            dxy_series = fetch_fred_series(market["fred_dxy"],  fred_key)
+            hy_spread  = fetch_fred_series(market["fred_hy_spread"], fred_key)
+            dgs2       = fetch_fred_series(market["fred_yield_curve"]["2y"], fred_key)
+            dgs10      = fetch_fred_series(market["fred_yield_curve"]["10y"], fred_key)
+            nfci       = fetch_fred_series(market["fred_nfci"], fred_key)
 
         # Breadth: FMP for constituents, Twelve Data for prices
         breadth_data  = {}
@@ -959,8 +931,8 @@ def main():
     dd_info  = compute_drawdown(close)
 
     current_rsi = rsi.iloc[-1]
-    current_vix = vix_data["Close"].iloc[-1] if not vix_data.empty else np.nan
-    current_dxy = dxy_data["Close"].iloc[-1] if not dxy_data.empty else np.nan
+    current_vix = vix_series.iloc[-1] if not vix_series.empty else np.nan
+    current_dxy = dxy_series.iloc[-1] if not dxy_series.empty else np.nan
 
     yield_curve_val = np.nan
     if not dgs10.empty and not dgs2.empty:
@@ -1094,15 +1066,15 @@ def main():
 
         sc1, sc2 = st.columns(2)
         with sc1:
-            if not vix_data.empty:
-                vix_close = filter_by_date_range(vix_data["Close"], chart_days)
+            if not vix_series.empty:
+                vix_close = filter_by_date_range(vix_series, chart_days)
                 fig = go.Figure()
                 fig.add_trace(go.Scatter(x=vix_close.index, y=vix_close.values, name="VIX",
                                          line=dict(color="#f59e0b", width=2),
                                          fill="tozeroy", fillcolor="rgba(245,158,11,0.08)"))
                 fig.add_hline(y=20, line_color="#334155", line_dash="dot",  line_width=1, annotation_text="Long-term avg")
                 fig.add_hline(y=30, line_color="#f87171", line_dash="dash", line_width=1, annotation_text="Elevated fear")
-                fig.update_layout(title="CBOE Volatility Index (VIX)", **CHART_LAYOUT)
+                fig.update_layout(title="CBOE Volatility Index (VIX) — Source: FRED/CBOE", **CHART_LAYOUT)
                 st.plotly_chart(fig, use_container_width=True)
 
         with sc2:
@@ -1401,8 +1373,8 @@ def main():
             z_scores["Shiller CAPE"] = (cape_cur - cape_mean) / cape_std if cape_std > 0 else 0
         if len(rsi.dropna()) > 50:
             z_scores["RSI (14)"] = (current_rsi - rsi.mean()) / rsi.std()
-        if not vix_data.empty:
-            vix_all = vix_data["Close"].dropna()
+        if not vix_series.empty:
+            vix_all = vix_series.dropna()
             if len(vix_all) > 50:
                 z_scores["VIX"] = (current_vix - vix_all.mean()) / vix_all.std()
         dd_all = dd_info["series"].dropna()
@@ -1454,20 +1426,23 @@ def main():
 
         st.markdown("""
         <div style="font-family:'DM Sans',sans-serif; font-size:0.78rem; color:#6b7d93; margin-top:0.3rem;">
-            <strong>Trailing P/E</strong> and <strong>Forward P/E</strong> sourced from FMP (Financial Modeling Prep).
-            <strong>Shiller CAPE</strong> from bundled CSV (update periodically from multpl.com).
+            <strong>Trailing P/E</strong> and <strong>Forward P/E</strong> — enter manually via the sidebar (☰).
+            Suggested sources: <a href="https://www.multpl.com/s-p-500-pe-ratio" target="_blank" style="color:#60a5fa">multpl.com</a>
+            or <a href="https://yardeni.com/charts/sp-500-sectors-forward-p-e-ratios/" target="_blank" style="color:#60a5fa">Yardeni</a>.
+            FMP Starter plan does not expose SPY ratio endpoints (requires Premium+).
+            <strong>Shiller CAPE</strong> from bundled CSV — update periodically from multpl.com.
             Valuation indicators are slow-moving — best used as long-term context, not timing signals.
         </div>""", unsafe_allow_html=True)
 
-        if not dxy_data.empty:
+        if not dxy_series.empty:
             st.markdown('<div class="section-header" style="margin-top:1rem">US Dollar Index</div>',
                         unsafe_allow_html=True)
-            dxy_close = filter_by_date_range(dxy_data["Close"], chart_days)
+            dxy_close = filter_by_date_range(dxy_series, chart_days)
             fig = go.Figure()
-            fig.add_trace(go.Scatter(x=dxy_close.index, y=dxy_close.values, name="DXY",
+            fig.add_trace(go.Scatter(x=dxy_close.index, y=dxy_close.values, name="USD Index",
                                      line=dict(color="#38bdf8", width=2),
                                      fill="tozeroy", fillcolor="rgba(56,189,248,0.08)"))
-            fig.update_layout(title="US Dollar Index (DXY)", yaxis_range=[80, 120], **CHART_LAYOUT)
+            fig.update_layout(title="Fed Broad US Dollar Index (DTWEXBGS) — Source: FRED", **CHART_LAYOUT)
             st.plotly_chart(fig, use_container_width=True)
 
     # ────── 2×2 MATRIX TAB ──────
@@ -1520,7 +1495,7 @@ def main():
     st.markdown(f"""
     <div style="font-family:'JetBrains Mono',monospace; font-size:0.7rem; color:#475569; text-align:center; padding:0.5rem 0;">
         Last refresh: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} &nbsp;|&nbsp;
-        Price data: Twelve Data &nbsp;|&nbsp; Valuation: FMP &nbsp;|&nbsp; Financial conditions: FRED &nbsp;|&nbsp; Sentiment: AAII &nbsp;|&nbsp;
+        Price data: Twelve Data &nbsp;|&nbsp; VIX &amp; DXY: FRED &nbsp;|&nbsp; Conditions &amp; Valuation: FRED &nbsp;|&nbsp; Sentiment: AAII &nbsp;|&nbsp;
         AAII data: {'current' if not aaii_status['stale'] else f'{aaii_status["days"]}d old'} &nbsp;|&nbsp;
         This dashboard is for informational purposes only — not financial advice.
     </div>
